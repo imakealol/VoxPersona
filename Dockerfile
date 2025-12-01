@@ -52,42 +52,11 @@ RUN pip install --no-cache-dir \
     sentence-transformers
 
 # ============================================================================
-# Stage 4: Model pre-loading
-# Pre-download embedding models for runtime performance
-# ============================================================================
-FROM pytorch-stage as models-stage
-
-# Pre-download embedding models for caching in the Docker image
-# This stage will be cached unless model versions change
-RUN python - <<'PY'
-from sentence_transformers import SentenceTransformer
-
-# Pre-download embedding models so that they are cached in the Docker image
-# Models are downloaded to the default cache directory in the container
-models = [
-    'BAAI/bge-m3',
-    'sentence-transformers/all-MiniLM-L6-v2',
-]
-
-print("Starting model pre-loading...")
-for model_name in models:
-    try:
-        print(f"Downloading model: {model_name}")
-        SentenceTransformer(model_name)
-        print(f"Successfully downloaded model: {model_name}")
-    except Exception as e:
-        # Do not fail the build if download fails; models can be downloaded at runtime
-        print(f"Warning: could not download {model_name}: {e}")
-        print("Model will be downloaded at runtime if needed")
-
-print("Model pre-loading completed")
-PY
-
-# ============================================================================
-# Stage 5: Application code
+# Stage 4: Application code
 # Final stage with application code - this will change most frequently
+# Models are loaded from volume mount at runtime (not baked into image)
 # ============================================================================
-FROM models-stage as final
+FROM pytorch-stage as final
 
 # Create logs directory
 RUN mkdir -p /app/logs

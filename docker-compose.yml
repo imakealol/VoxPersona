@@ -83,7 +83,8 @@ services:
       - ./data:/home/voxpersona_user/VoxPersona/data
       # Cache volumes for development
       - pip_cache:/root/.cache/pip
-      - huggingface_cache:/root/.cache/huggingface
+      # HuggingFace models from host bind mount (not rebuilt each time)
+      - ./model_cache/huggingface:/root/.cache/huggingface
     networks:
       - voxpersona_default
     healthcheck:
@@ -156,8 +157,7 @@ volumes:
   # Cache volumes for improved build performance
   pip_cache:
     driver: local
-  huggingface_cache:
-    driver: local
+  # huggingface_cache removed - using bind mount instead
   logs:
     driver: local
 
