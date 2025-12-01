@@ -1,4 +1,4 @@
-name: Intelligent VoxPersona Deployment
+name: Parallel VoxPersona Deployment
 
 on:
   workflow_run:
@@ -17,30 +17,47 @@ on:
         - full
         - app-only
         - no-restart
+      target_environment:
+        description: 'Target deployment environment'
+        required: false
+        default: 'both'
+        type: choice
+        options:
+        - both
+        - production
+        - dev
 
 env:
-  DEPLOY_PATH: /home/voxpersona_user
-  PROJECT_PATH: /home/voxpersona_user/VoxPersona
-  APP_PATH: /home/voxpersona_user/app
   SSH_OPTIONS: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
 
 jobs:
-  deploy:
+  # ============================================================
+  # JOB 1: Analyze Changes (один раз для всех серверов)
+  # ============================================================
+  analyze-changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     if: |
       github.event_name == 'workflow_dispatch' ||
       github.event.workflow_run.conclusion == 'success'
 
+    outputs:
+      deployment_type: ${{ steps.deployment_analysis.outputs.deployment_type }}
+      changed_files_count: ${{ steps.deployment_analysis.outputs.changed_files_count }}
+      new_commit: ${{ github.sha }}
+
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
     - name: Validate and sanitize user inputs
       id: validate_inputs
       env:
         USER_RESTART_TYPE: ${{ github.event.inputs.force_restart_type || 'auto' }}
       run: |
         echo "🔒 Validating user inputs for security..."
-        
-        # Validate force_restart_type input using environment variable only
         case "$USER_RESTART_TYPE" in
           "auto"|"full"|"app-only"|"no-restart")
             echo "✅ Valid restart type: $USER_RESTART_TYPE"
@@ -48,106 +65,23 @@ jobs:
             ;;
           *)
             echo "❌ Invalid restart type: $USER_RESTART_TYPE"
-            echo "🔒 Only allowed values: auto, full, app-only, no-restart"
             exit 1
             ;;
         esac
-    
-    - name: Checkout code
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
-    
-    - name: Set up Python 3.10.11
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.10.11"
-    
-    - name: Verify Python version compatibility
-      run: |
-        echo "🐍 Checking Python version..."
-        python --version
-        python -c "import sys; assert sys.version_info[:2] == (3, 10), f'Expected Python 3.10, got {sys.version_info[:2]}'"
-        echo "✅ Python version verified: $(python --version)"
-    
-    - name: Setup SSH Key
-      uses: webfactory/ssh-agent@v0.7.0
-      with:
-        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-    
-    - name: Add server to known hosts
-      run: |
-        ssh-keyscan -H ${{ secrets.SERVER_IP }} >> ~/.ssh/known_hosts
-    
-    - name: Test SSH Connection
-      run: |
-        echo "🔗 Testing SSH connection..."
-        ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "echo 'SSH connection successful'"
-    
-    - name: Get current deployment state
-      id: deployment_state
-      run: |
-        echo "📊 Gathering deployment state information..."
-        
-        # Get current commit hash on server
-        OLD_COMMIT=$(ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "cd ${{ env.PROJECT_PATH }} 2>/dev/null && git rev-parse HEAD 2>/dev/null || echo 'none'")
-        echo "old_commit=$OLD_COMMIT" >> $GITHUB_OUTPUT
-        echo "Current server commit: $OLD_COMMIT"
-        
-        # Get new commit hash (current)
-        NEW_COMMIT="${{ github.sha }}"
-        echo "new_commit=$NEW_COMMIT" >> $GITHUB_OUTPUT
-        echo "New deployment commit: $NEW_COMMIT"
-        
-        # Record deployment start time
-        DEPLOY_START=$(date +%s)
-        echo "deploy_start=$DEPLOY_START" >> $GITHUB_OUTPUT
-    
-    - name: Sync repository to server
-      run: |
-        echo "🔄 Syncing repository to server..."
-        
-        # Ensure project directory exists
-        ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "mkdir -p ${{ env.DEPLOY_PATH }}"
-        
-        # Clone or update repository
-        ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} '
-          if [ ! -d "${{ env.PROJECT_PATH }}/.git" ]; then
-            echo "🆕 Cloning repository for first time..."
-            rm -rf ${{ env.PROJECT_PATH }}
-            git clone https://github.com/${{ github.repository }}.git ${{ env.PROJECT_PATH }}
-          else
-            echo "📥 Updating existing repository..."
-            cd ${{ env.PROJECT_PATH }}
-            git fetch origin
-            git reset --hard origin/main
-          fi
-        '
-    
+
     - name: Analyze changes and determine deployment type
       id: deployment_analysis
       env:
         VALIDATED_RESTART_TYPE: ${{ steps.validate_inputs.outputs.validated_restart_type }}
-        OLD_COMMIT: ${{ steps.deployment_state.outputs.old_commit }}
-        NEW_COMMIT: ${{ steps.deployment_state.outputs.new_commit }}
       run: |
         echo "🔍 Analyzing changes to determine deployment type..."
-        
-        # Get changed files between commits
-        CHANGED_FILES=$(ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "
-          cd ${{ env.PROJECT_PATH }}
-          if [ '$OLD_COMMIT' != 'none' ]; then
-            git diff --name-only $OLD_COMMIT $NEW_COMMIT
-          else
-            echo 'Initial deployment - treating as FULL_RESTART'
-            echo 'docker-compose.yml'
-          fi
-        ")
-        
+
+        # Get changed files in last commit
+        CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "initial")
         echo "Changed files:"
         echo "$CHANGED_FILES"
-        
-        # Determine deployment type based on manual input or file analysis
+
+        # Determine deployment type
         if [ "$VALIDATED_RESTART_TYPE" != "" ] && [ "$VALIDATED_RESTART_TYPE" != "auto" ]; then
           case "$VALIDATED_RESTART_TYPE" in
             "full") DEPLOY_TYPE="FULL_RESTART" ;;
@@ -156,189 +90,286 @@ jobs:
           esac
           echo "🎯 Manual deployment type: $DEPLOY_TYPE"
         else
-          # Automatic detection logic
-          if echo "$CHANGED_FILES" | grep -E "(docker-compose\.yml|Dockerfile|requirements\.txt|\.sql$|sql_scripts/)" > /dev/null || [ "$OLD_COMMIT" = "none" ]; then
+          # Automatic detection
+          if echo "$CHANGED_FILES" | grep -E "(docker-compose\.yml|Dockerfile|requirements\.txt|\.sql$|sql_scripts/)" > /dev/null; then
             DEPLOY_TYPE="FULL_RESTART"
-            echo "🔄 Detected FULL_RESTART: Infrastructure files changed"
           elif echo "$CHANGED_FILES" | grep -E "(\.py$|src/|prompts/|prompts-by-scenario/)" > /dev/null; then
-            DEPLOY_TYPE="APP_ONLY" 
-            echo "🚀 Detected APP_ONLY: Application files changed"
-          elif echo "$CHANGED_FILES" | grep -E "(\.md$|\.txt$|\.rst$|README|CHANGELOG|\.gitignore$|DEPLOYMENT_GUIDE)" > /dev/null && ! echo "$CHANGED_FILES" | grep -v -E "(\.md$|\.txt$|\.rst$|README|CHANGELOG|\.gitignore$|DEPLOYMENT_GUIDE)" > /dev/null; then
+            DEPLOY_TYPE="APP_ONLY"
+          elif echo "$CHANGED_FILES" | grep -E "(\.md$|\.txt$|\.rst$|README|CHANGELOG|\.gitignore$)" > /dev/null; then
             DEPLOY_TYPE="NO_RESTART"
-            echo "📝 Detected NO_RESTART: Documentation only changes"
           else
             DEPLOY_TYPE="APP_ONLY"
-            echo "🔄 Default to APP_ONLY: Unknown file types detected"
           fi
         fi
-        
+
         echo "deployment_type=$DEPLOY_TYPE" >> $GITHUB_OUTPUT
         echo "changed_files_count=$(echo '$CHANGED_FILES' | wc -l)" >> $GITHUB_OUTPUT
-        
         echo "📋 Final deployment decision: $DEPLOY_TYPE"
-    
-    - name: Execute deployment
-      id: execute_deployment
-      env:
-        DEPLOY_TYPE: ${{ steps.deployment_analysis.outputs.deployment_type }}
+
+  # ============================================================
+  # JOB 2: Deploy to MIRAGE Production
+  # ============================================================
+  deploy-production:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: analyze-changes
+    if: |
+      github.event.inputs.target_environment == 'both' ||
+      github.event.inputs.target_environment == 'production' ||
+      github.event.inputs.target_environment == null
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup SSH Key
+      uses: webfactory/ssh-agent@v0.7.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Add MIRAGE to known hosts
       run: |
-        echo "🚀 Executing $DEPLOY_TYPE deployment..."
-        
-        ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "
-          cd ${{ env.PROJECT_PATH }}
+        ssh-keyscan -p ${{ secrets.MIRAGE_SERVER_PORT }} -H ${{ secrets.MIRAGE_SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+    - name: Test SSH Connection to MIRAGE
+      run: |
+        echo "🔗 Testing SSH connection to MIRAGE Production..."
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.MIRAGE_SERVER_PORT }} ${{ secrets.MIRAGE_SERVER_USER }}@${{ secrets.MIRAGE_SERVER_IP }} "echo '✅ SSH connection to MIRAGE successful'"
+
+    - name: Sync repository to MIRAGE
+      run: |
+        echo "🔄 Syncing repository to MIRAGE Production..."
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.MIRAGE_SERVER_PORT }} ${{ secrets.MIRAGE_SERVER_USER }}@${{ secrets.MIRAGE_SERVER_IP }} "
+          if [ ! -d '${{ secrets.MIRAGE_DEPLOY_PATH }}/.git' ]; then
+            echo '🆕 Cloning repository for first time...'
+            mkdir -p \$(dirname ${{ secrets.MIRAGE_DEPLOY_PATH }})
+            rm -rf ${{ secrets.MIRAGE_DEPLOY_PATH }}
+            git clone https://github.com/${{ github.repository }}.git ${{ secrets.MIRAGE_DEPLOY_PATH }}
+          else
+            echo '📥 Updating existing repository...'
+            cd ${{ secrets.MIRAGE_DEPLOY_PATH }}
+            git fetch origin
+            git reset --hard origin/main
+          fi
+        "
+
+    - name: Check .env file on MIRAGE
+      run: |
+        echo "📝 Checking .env file on MIRAGE..."
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.MIRAGE_SERVER_PORT }} ${{ secrets.MIRAGE_SERVER_USER }}@${{ secrets.MIRAGE_SERVER_IP }} "
+          cd ${{ secrets.MIRAGE_DEPLOY_PATH }}
+          if [ -f .env ]; then
+            echo '✅ .env file exists'
+          else
+            echo '❌ ERROR: .env file not found! Create it manually on the server.'
+            exit 1
+          fi
+        "
+
+    - name: Execute deployment on MIRAGE
+      env:
+        DEPLOY_TYPE: ${{ needs.analyze-changes.outputs.deployment_type }}
+      run: |
+        echo "🚀 Executing $DEPLOY_TYPE deployment on MIRAGE Production..."
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.MIRAGE_SERVER_PORT }} ${{ secrets.MIRAGE_SERVER_USER }}@${{ secrets.MIRAGE_SERVER_IP }} "
+          cd ${{ secrets.MIRAGE_DEPLOY_PATH }}
 
           case '$DEPLOY_TYPE' in
             'FULL_RESTART')
-              echo '🔄 Executing FULL_RESTART: Rebuilding all containers with cache optimization...'
+              echo '🔄 FULL_RESTART on MIRAGE...'
               docker compose down || true
               DOCKER_BUILDKIT=1 docker compose build --pull
               docker compose up -d
-              echo '✅ FULL_RESTART completed with layer caching'
               ;;
             'APP_ONLY')
-              echo '🚀 Executing APP_ONLY: Rebuilding app container with cache optimization...'
+              echo '🚀 APP_ONLY on MIRAGE...'
               docker compose stop voxpersona || true
               DOCKER_BUILDKIT=1 docker compose build voxpersona
               docker compose up -d voxpersona
-              echo '✅ APP_ONLY completed with layer caching'
               ;;
             'NO_RESTART')
-              echo '📝 Executing NO_RESTART: Files synced, no container restart needed'
-              echo '✅ NO_RESTART completed'
+              echo '📝 NO_RESTART on MIRAGE - files synced only'
               ;;
           esac
         "
-    
-    - name: Health checks and verification
-      id: health_check
-      env:
-        DEPLOY_TYPE: ${{ steps.deployment_analysis.outputs.deployment_type }}
-      run: |
-        if [ "$DEPLOY_TYPE" != "NO_RESTART" ]; then
-          echo "🏥 Running health checks..."
-          
-          # Wait for containers to stabilize
-          sleep 15
-          
-          # Check container status
-          ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "
-            cd ${{ env.PROJECT_PATH }}
 
-            echo '📊 Container status:'
-            docker compose ps
-
-            # Check if voxpersona container is running
-            CONTAINER_STATUS=\$(docker ps --filter 'name=voxpersona_app' --format '{{.Status}}')
-            if [[ \$CONTAINER_STATUS == *'Up'* ]]; then
-              echo '✅ VoxPersona container is running'
-            else
-              echo '❌ VoxPersona container failed to start'
-              docker compose logs --tail=50 voxpersona
-              exit 1
-            fi
-
-            # Additional health checks for full restart
-            if [ '$DEPLOY_TYPE' = 'FULL_RESTART' ]; then
-              POSTGRES_STATUS=\$(docker ps --filter 'name=voxpersona_postgres' --format '{{.Status}}')
-              if [[ \$POSTGRES_STATUS == *'Up'* ]]; then
-                echo '✅ PostgreSQL container is running'
-              else
-                echo '❌ PostgreSQL container failed to start'
-                docker compose logs --tail=50 postgres
-                exit 1
-              fi
-            fi
-            
-            # Test application configuration loading
-            timeout 30 docker exec voxpersona_app python -c 'import src.config; print(\"Configuration loaded successfully\")' || {
-              echo '❌ Application configuration test failed'
-              docker compose logs --tail=50 voxpersona
-              exit 1
-            }
-            
-            echo '✅ All health checks passed'
-          "
-        else
-          echo "⏭️  Skipping health checks for NO_RESTART deployment"
-        fi
-    
-    - name: Calculate deployment metrics
-      id: metrics
-      env:
-        DEPLOY_START: ${{ steps.deployment_state.outputs.deploy_start }}
-        DEPLOY_TYPE: ${{ steps.deployment_analysis.outputs.deployment_type }}
-        FILES_CHANGED: ${{ steps.deployment_analysis.outputs.changed_files_count }}
-        OLD_COMMIT: ${{ steps.deployment_state.outputs.old_commit }}
-        NEW_COMMIT: ${{ steps.deployment_state.outputs.new_commit }}
+    - name: Health check MIRAGE
+      if: needs.analyze-changes.outputs.deployment_type != 'NO_RESTART'
       run: |
-        DEPLOY_END=$(date +%s)
-        DURATION=$((DEPLOY_END - DEPLOY_START))
-        echo "duration=$DURATION" >> $GITHUB_OUTPUT
-        
-        echo "📊 Deployment Metrics:"
-        echo "  - Type: $DEPLOY_TYPE"
-        echo "  - Duration: ${DURATION}s"
-        echo "  - Files changed: $FILES_CHANGED"
-        echo "  - Commit: $OLD_COMMIT → $NEW_COMMIT"
-    
-    - name: Log deployment success
-      env:
-        DEPLOY_TYPE: ${{ steps.deployment_analysis.outputs.deployment_type }}
-        OLD_COMMIT: ${{ steps.deployment_state.outputs.old_commit }}
-        NEW_COMMIT: ${{ steps.deployment_state.outputs.new_commit }}
-        DURATION: ${{ steps.metrics.outputs.duration }}
-        COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-      run: |
-        echo "✅ Deployment completed successfully!"
-        
-        # Log to server
-        ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "
-          echo '$(date -Iseconds) [DEPLOY] $DEPLOY_TYPE: $OLD_COMMIT → $NEW_COMMIT (${DURATION}s)' >> ${{ env.PROJECT_PATH }}/deployment.log
+        echo "🏥 Running health checks on MIRAGE..."
+        sleep 20
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.MIRAGE_SERVER_PORT }} ${{ secrets.MIRAGE_SERVER_USER }}@${{ secrets.MIRAGE_SERVER_IP }} "
+          cd ${{ secrets.MIRAGE_DEPLOY_PATH }}
+          docker compose ps
+
+          CONTAINER_STATUS=\$(docker ps --filter 'name=voxpersona_app' --format '{{.Status}}')
+          if [[ \$CONTAINER_STATUS == *'Up'* ]] || [[ \$CONTAINER_STATUS == *'healthy'* ]]; then
+            echo '✅ MIRAGE VoxPersona container is running'
+          else
+            echo '❌ MIRAGE VoxPersona container failed'
+            docker compose logs --tail=50 voxpersona
+            exit 1
+          fi
         "
-        
-        echo "🎉 VoxPersona deployment completed:"
-        echo "  ✨ Type: $DEPLOY_TYPE"
-        echo "  ⏱️  Duration: $DURATION seconds"
-        echo "  📝 Commit: $COMMIT_MESSAGE"
-    
-    - name: Rollback on failure
-      if: failure()
-      env:
-        OLD_COMMIT: ${{ steps.deployment_state.outputs.old_commit }}
-        NEW_COMMIT: ${{ steps.deployment_state.outputs.new_commit }}
+
+    - name: Log deployment on MIRAGE
       run: |
-        echo "🚨 Deployment failed, initiating rollback..."
-        
-        if [ "$OLD_COMMIT" != "none" ]; then
-          ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "
-            cd ${{ env.PROJECT_PATH }}
-            echo '🔄 Rolling back to previous commit: $OLD_COMMIT'
-            git reset --hard $OLD_COMMIT
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.MIRAGE_SERVER_PORT }} ${{ secrets.MIRAGE_SERVER_USER }}@${{ secrets.MIRAGE_SERVER_IP }} "
+          echo \"\$(date -Iseconds) [DEPLOY] ${{ needs.analyze-changes.outputs.deployment_type }}: ${{ github.sha }}\" >> ${{ secrets.MIRAGE_DEPLOY_PATH }}/deployment.log
+        "
 
-            # Restart application
-            docker compose stop voxpersona || true
-            docker compose up -d voxpersona
+  # ============================================================
+  # JOB 3: Deploy to OLD Server Dev/Staging (parallel)
+  # ============================================================
+  deploy-dev:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: analyze-changes
+    if: |
+      github.event.inputs.target_environment == 'both' ||
+      github.event.inputs.target_environment == 'dev' ||
+      github.event.inputs.target_environment == null
 
-            echo '✅ Rollback completed'
-          "
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup SSH Key
+      uses: webfactory/ssh-agent@v0.7.0
+      with:
+        ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Add Dev Server to known hosts
+      run: |
+        ssh-keyscan -p ${{ secrets.DEV_SERVER_PORT }} -H ${{ secrets.DEV_SERVER_IP }} >> ~/.ssh/known_hosts 2>/dev/null || true
+
+    - name: Test SSH Connection to Dev Server
+      run: |
+        echo "🔗 Testing SSH connection to Dev Server..."
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.DEV_SERVER_PORT }} ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_IP }} "echo '✅ SSH connection to Dev Server successful'"
+
+    - name: Sync repository to Dev Server
+      run: |
+        echo "🔄 Syncing repository to Dev Server..."
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.DEV_SERVER_PORT }} ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_IP }} "
+          if [ ! -d '${{ secrets.DEV_DEPLOY_PATH }}/.git' ]; then
+            echo '🆕 Cloning repository for first time...'
+            mkdir -p \$(dirname ${{ secrets.DEV_DEPLOY_PATH }})
+            rm -rf ${{ secrets.DEV_DEPLOY_PATH }}
+            git clone https://github.com/${{ github.repository }}.git ${{ secrets.DEV_DEPLOY_PATH }}
+          else
+            echo '📥 Updating existing repository...'
+            cd ${{ secrets.DEV_DEPLOY_PATH }}
+            git fetch origin
+            git reset --hard origin/main
+          fi
+        "
+
+    - name: Check .env file on Dev Server
+      run: |
+        echo "📝 Checking .env file on Dev Server..."
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.DEV_SERVER_PORT }} ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_IP }} "
+          cd ${{ secrets.DEV_DEPLOY_PATH }}
+          if [ -f .env ]; then
+            echo '✅ .env file exists'
+          else
+            echo '❌ ERROR: .env file not found! Create it manually on the server.'
+            exit 1
+          fi
+        "
+
+    - name: Execute deployment on Dev Server
+      env:
+        DEPLOY_TYPE: ${{ needs.analyze-changes.outputs.deployment_type }}
+      run: |
+        echo "🚀 Executing $DEPLOY_TYPE deployment on Dev Server..."
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.DEV_SERVER_PORT }} ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_IP }} "
+          cd ${{ secrets.DEV_DEPLOY_PATH }}
+
+          case '$DEPLOY_TYPE' in
+            'FULL_RESTART')
+              echo '🔄 FULL_RESTART on Dev Server...'
+              docker compose down || true
+              DOCKER_BUILDKIT=1 docker compose build --pull
+              docker compose up -d
+              ;;
+            'APP_ONLY')
+              echo '🚀 APP_ONLY on Dev Server...'
+              docker compose stop voxpersona || true
+              DOCKER_BUILDKIT=1 docker compose build voxpersona
+              docker compose up -d voxpersona
+              ;;
+            'NO_RESTART')
+              echo '📝 NO_RESTART on Dev Server - files synced only'
+              ;;
+          esac
+        "
+
+    - name: Health check Dev Server
+      if: needs.analyze-changes.outputs.deployment_type != 'NO_RESTART'
+      run: |
+        echo "🏥 Running health checks on Dev Server..."
+        sleep 20
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.DEV_SERVER_PORT }} ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_IP }} "
+          cd ${{ secrets.DEV_DEPLOY_PATH }}
+          docker compose ps
+
+          CONTAINER_STATUS=\$(docker ps --filter 'name=voxpersona_app' --format '{{.Status}}')
+          if [[ \$CONTAINER_STATUS == *'Up'* ]] || [[ \$CONTAINER_STATUS == *'healthy'* ]]; then
+            echo '✅ Dev VoxPersona container is running'
+          else
+            echo '❌ Dev VoxPersona container failed'
+            docker compose logs --tail=50 voxpersona
+            exit 1
+          fi
+        "
+
+    - name: Log deployment on Dev Server
+      run: |
+        ssh ${{ env.SSH_OPTIONS }} -p ${{ secrets.DEV_SERVER_PORT }} ${{ secrets.DEV_SERVER_USER }}@${{ secrets.DEV_SERVER_IP }} "
+          echo \"\$(date -Iseconds) [DEPLOY] ${{ needs.analyze-changes.outputs.deployment_type }}: ${{ github.sha }}\" >> ${{ secrets.DEV_DEPLOY_PATH }}/deployment.log
+        "
+
+  # ============================================================
+  # JOB 4: Deployment Summary
+  # ============================================================
+  deployment-summary:
+    runs-on: ubuntu-latest
+    needs: [analyze-changes, deploy-production, deploy-dev]
+    if: always()
+
+    steps:
+    - name: Generate deployment summary
+      env:
+        DEPLOY_TYPE: ${{ needs.analyze-changes.outputs.deployment_type }}
+        FILES_CHANGED: ${{ needs.analyze-changes.outputs.changed_files_count }}
+        PROD_STATUS: ${{ needs.deploy-production.result }}
+        DEV_STATUS: ${{ needs.deploy-dev.result }}
+      run: |
+        echo "📊 =============================================="
+        echo "📊 DEPLOYMENT SUMMARY"
+        echo "📊 =============================================="
+        echo "📋 Deployment Type: $DEPLOY_TYPE"
+        echo "📝 Files Changed: $FILES_CHANGED"
+        echo "🏭 Production (MIRAGE): $PROD_STATUS"
+        echo "🧪 Dev (OLD Server): $DEV_STATUS"
+        echo "📊 =============================================="
+
+        if [ "$PROD_STATUS" == "success" ] && [ "$DEV_STATUS" == "success" ]; then
+          echo "✅ All deployments completed successfully!"
+        elif [ "$PROD_STATUS" == "success" ] && [ "$DEV_STATUS" == "skipped" ]; then
+          echo "✅ Production deployment completed successfully!"
+        elif [ "$PROD_STATUS" == "skipped" ] && [ "$DEV_STATUS" == "success" ]; then
+          echo "✅ Dev deployment completed successfully!"
+        elif [ "$PROD_STATUS" == "skipped" ] && [ "$DEV_STATUS" == "skipped" ]; then
+          echo "⏭️ Both deployments skipped (target_environment filter)"
         else
-          echo "⚠️  No previous commit to rollback to (initial deployment)"
+          echo "❌ Some deployments failed. Check logs above."
+          if [ "$PROD_STATUS" == "failure" ]; then
+            echo "  🏭 Production failed!"
+          fi
+          if [ "$DEV_STATUS" == "failure" ]; then
+            echo "  🧪 Dev failed!"
+          fi
+          exit 1
         fi
-        
-        # Log failure
-        ssh ${{ env.SSH_OPTIONS }} ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_IP }} "
-          echo '$(date -Iseconds) [DEPLOY-FAILED] Rollback executed: $NEW_COMMIT → $OLD_COMMIT' >> ${{ env.PROJECT_PATH }}/deployment.log
-        " || true
-    
-    - name: Notify on failure
-      if: failure()
-      env:
-        TARGET_COMMIT: ${{ github.sha }}
-        COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
-        DEPLOY_TYPE: ${{ steps.deployment_analysis.outputs.deployment_type }}
-      run: |
-        echo "💥 Deployment Failed Summary:"
-        echo "  🎯 Target commit: $TARGET_COMMIT"
-        echo "  📝 Commit message: $COMMIT_MESSAGE"
-        echo "  🔄 Deployment type: $DEPLOY_TYPE"
-        echo "  ⚠️  Check deployment logs on server: ${{ env.PROJECT_PATH }}/deployment.log"
