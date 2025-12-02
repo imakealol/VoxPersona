@@ -11,7 +11,10 @@ from docx import Document
 import os
 from typing import List
 
-from config import ANTHROPIC_API_KEY, ANTHROPIC_API_KEY_2, ANTHROPIC_API_KEY_3, ANTHROPIC_API_KEY_4, ANTHROPIC_API_KEY_5, ANTHROPIC_API_KEY_6, ANTHROPIC_API_KEY_7, user_states
+# ИСПРАВЛЕНИЕ (2025-12-02): Удалены импорты ANTHROPIC_API_KEY_2-7
+# Причина: эти ключи содержали placeholder значения, вызывая ошибки API
+# См. inspection.md для деталей
+from config import ANTHROPIC_API_KEY, user_states
 from utils import run_loading_animation, smart_send_text_unified, grouped_reports_to_string, get_username_from_chat
 from db_handler.db import fetch_prompts_for_scenario_reporttype_building, fetch_prompt_by_name
 from datamodels import mapping_report_type_names, mapping_building_names, REPORT_MAPPING, CLASSIFY_DESIGN, CLASSIFY_INTERVIEW
@@ -511,7 +514,10 @@ def run_fast_search(text: str, rag) -> str:
     return answer
 
 def run_deep_search(content: str, text: str, chat_id: int, app: Client, category: str) -> str:
-    api_keys = [ANTHROPIC_API_KEY, ANTHROPIC_API_KEY_2, ANTHROPIC_API_KEY_3, ANTHROPIC_API_KEY_4, ANTHROPIC_API_KEY_5, ANTHROPIC_API_KEY_6, ANTHROPIC_API_KEY_7]
+    # ИСПРАВЛЕНИЕ (2025-12-02): Используем только основной валидный API ключ
+    # Placeholder ключи ANTHROPIC_API_KEY_2-7 удалены - они содержали невалидные значения
+    # что вызывало "Ошибка Claude" при ротации ключей
+    api_keys = [ANTHROPIC_API_KEY]
 
     chunks = re.split(r'^# Чанк transcription_id \d+', content, flags=re.MULTILINE)
     chunks = [chunk.strip() for chunk in chunks if chunk.strip()]
